@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import http from "http";
+import { randomUUID } from "crypto";
 import { execSync, spawn } from 'child_process';
 import fs, { promises as fsPromises } from 'fs';
 import os from 'os';
@@ -900,14 +902,87 @@ server.tool(
     }
 );
 
-// Run the server
+// Run the server over Streamable HTTP
+const PORT = Number(process.env.PORT || 8200);
+const PATHNAME = process.env.MCP_PATH || "/mcp";
+
+// Persist one transport per MCP session (identified by session ID).
+const transports = new Map();
+
 async function main() {
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("Screenshot MCP Server running on stdio");
+    const httpServer = http.createServer(async (req, res) => {
+        const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+        if (url.pathname !== PATHNAME) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: `Not found: ${url.pathname}` }));
+            return;
+        }
+
+        // CORS for browsers
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Last-Event-ID");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+        res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+
+        if (req.method === "OPTIONS") {
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+
+        // Reuse an existing transport for this session, or create a new one.
+        const sessionId = req.headers["mcp-session-id"];
+        let transport = typeof sessionId === "string" ? transports.get(sessionId) : undefined;
+
+        if (!transport) {
+            transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => randomUUID(),
+                enableJsonResponse: true,
+                onsessioninitialized: (sid) => {
+                    // Map the session once the server assigns its ID.
+                    transports.set(sid, transport);
+                },
+            });
+            await server.connect(transport);
+            transport.onclose = () => {
+                transports.delete(transport.sessionId ?? sessionId);
+            };
+        }
+
+        if (req.method === "GET" || req.method === "DELETE") {
+            transport.handleRequest(req, res);
+        } else if (req.method === "POST") {
+            let body = "";
+            req.on("data", (chunk) => { body += chunk; });
+            req.on("end", async () => {
+                try {
+                    const parsed = body ? JSON.parse(body) : undefined;
+                    transport.handleRequest(req, res, parsed);
+                } catch (e) {
+                    res.writeHead(400, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({ error: "Invalid JSON body", detail: String(e) }));
+                }
+            });
+        } else {
+            res.writeHead(405, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Method not allowed" }));
+        }
+    });
+
+    httpServer.listen(PORT, "0.0.0.0", () => {
+        console.error(`Screenshot MCP Server running on Streamable HTTP at http://0.0.0.0:${PORT}${PATHNAME}`);
+    });
+
+    const shutdown = async () => {
+        await cleanupBrowser();
+        httpServer.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 2000);
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
 }
 
 main().catch((error) => {
     console.error("Fatal error in main():", error);
-    process.exit(1);
-});
+    process.exit(1);});
