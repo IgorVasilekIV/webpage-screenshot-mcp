@@ -70,3 +70,5 @@ yarn-error.log
 
 # Project specific
 .mcp-screenshot-cookies/
+# Project docs (not tracked)
+AGENTS.md
