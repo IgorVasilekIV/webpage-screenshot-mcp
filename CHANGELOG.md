@@ -26,6 +26,19 @@ Fork of [ananddtyagi/webpage-screenshot-mcp](https://github.com/ananddtyagi/webp
 
 ### Removed
 - `StdioServerTransport` import (replaced by Streamable HTTP).
+- `login-and-wait`, `clear-auth-cookies`, `signal-login-complete` tools (cookie-based auth removed for public use).
+- `useSavedAuth`, `reuseAuthPage`, `visibleBrowser`, `useDefaultBrowser` parameters.
+- All anti-detection / fingerprint spoofing code (navigator.webdriver, fake plugins, etc.).
+- `--disable-web-security` Chromium flag.
+- Cookie persistence (`~/.mcp-screenshot-cookies/`, `saveCookies`, `loadCookies`).
+- Persistent browser page between tool calls.
+
+### Added (security hardening)
+- **Rate limiting**: 10 tool calls per minute per IP, returns HTTP 429 on excess.
+- **URL blacklist**: blocks `localhost`, `127.*`, `10.*`, `172.16-31.*`, `192.168.*`, `169.254.169.254`, `fe80:*`, `metadata.google.internal`.
+- **Browser idle timeout**: Chromium auto-closes after 5 minutes of inactivity.
+- **Ephemeral pages**: each tool call creates and destroys its own page.
+- **Protocol check**: only `http:` and `https:` URLs are accepted.
 
 ---
 

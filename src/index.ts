@@ -3,756 +3,268 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import http from "http";
 import { randomUUID } from "crypto";
-import { execSync, spawn } from 'child_process';
-import fs, { promises as fsPromises } from 'fs';
-import os from 'os';
-import path from 'path';
-import puppeteer, { Browser, Cookie, Page } from 'puppeteer';
+import puppeteer, { Browser, Page } from 'puppeteer';
 import { z } from 'zod';
 
-// Create the MCP server
+// ─── Rate Limiter ────────────────────────────────────────────────────────────
+
+interface RateLimitEntry {
+    count: number;
+    resetAt: number;
+}
+
+const rateLimiter = {
+    store: new Map<string, RateLimitEntry>(),
+    windowMs: 60_000,       // 1 minute window
+    maxRequests: 10,        // max 10 tool calls per minute per IP
+
+    allow(ip: string): boolean {
+        const now = Date.now();
+        const entry = this.store.get(ip);
+
+        if (!entry || now > entry.resetAt) {
+            this.store.set(ip, { count: 1, resetAt: now + this.windowMs });
+            return true;
+        }
+
+        if (entry.count >= this.maxRequests) {
+            return false;
+        }
+
+        entry.count++;
+        return true;
+    },
+
+    cleanup() {
+        const now = Date.now();
+        for (const [ip, entry] of this.store) {
+            if (now > entry.resetAt) {
+                this.store.delete(ip);
+            }
+        }
+    },
+};
+
+// Cleanup stale entries every 5 minutes
+setInterval(() => rateLimiter.cleanup(), 5 * 60_000).unref();
+
+// ─── URL Blacklist ───────────────────────────────────────────────────────────
+
+const BLOCKED_URL_PATTERNS: Array<{ test: (url: URL) => boolean; reason: string }> = [
+    // Loopback
+    {
+        test: (u) => u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '::1' || u.hostname === '[::1]',
+        reason: 'loopback address blocked',
+    },
+    // Link-local / metadata
+    {
+        test: (u) => u.hostname === '169.254.169.254',
+        reason: 'cloud metadata endpoint blocked',
+    },
+    // Private 10.x.x.x
+    {
+        test: (u) => /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(u.hostname),
+        reason: 'private network (10.x) blocked',
+    },
+    // Private 172.16-31.x.x
+    {
+        test: (u) => /^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/.test(u.hostname),
+        reason: 'private network (172.16-31.x) blocked',
+    },
+    // Private 192.168.x.x
+    {
+        test: (u) => /^192\.168\.\d{1,3}\.\d{1,3}$/.test(u.hostname),
+        reason: 'private network (192.168.x) blocked',
+    },
+    // IPv6 link-local
+    {
+        test: (u) => u.hostname.startsWith('fe80'),
+        reason: 'IPv6 link-local blocked',
+    },
+    // AWS/GCP/Azure metadata
+    {
+        test: (u) => u.hostname === 'metadata.google.internal' || u.hostname === 'metadata AzGuestConfig/instance',
+        reason: 'cloud metadata endpoint blocked',
+    },
+];
+
+function assertUrlAllowed(urlString: string): void {
+    let parsed: URL;
+    try {
+        parsed = new URL(urlString);
+    } catch {
+        throw new Error(`Invalid URL: ${urlString}`);
+    }
+
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error(`Protocol "${parsed.protocol}" not allowed. Use http: or https:.`);
+    }
+
+    for (const rule of BLOCKED_URL_PATTERNS) {
+        if (rule.test(parsed)) {
+            throw new Error(`URL blocked: ${rule.reason} (${parsed.hostname})`);
+        }
+    }
+}
+
+// ─── MCP Server ──────────────────────────────────────────────────────────────
+
 const server = new McpServer({
     name: "screenshot-page",
     version: "1.0.0",
 });
 
 let browser: Browser | null = null;
-let persistentPage: Page | null = null;
-const cookiesDir = path.join(os.homedir(), '.mcp-screenshot-cookies');
+const BROWSER_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes idle → close
+let browserIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
-// Ensure cookies directory exists
-async function ensureCookiesDir() {
-    try {
-        await fsPromises.mkdir(cookiesDir, { recursive: true });
-    } catch (error) {
-        console.error('Error creating cookies directory:', error);
-    }
-}
-
-// Get path to default Chrome/Edge installation
-function getDefaultBrowserPath(): string | null {
-    try {
-        if (process.platform === 'darwin') {
-            // Check for Chrome first
-            try {
-                return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-            } catch (e) {
-                // Then check for Edge
-                try {
-                    return '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge';
-                } catch (e) {
-                    // Then Safari (though Puppeteer doesn't work well with Safari)
-                    return '/Applications/Safari.app/Contents/MacOS/Safari';
-                }
-            }
-        } else if (process.platform === 'win32') {
-            // On Windows, try to find Chrome or Edge
-            try {
-                const chromePath = execSync('where chrome').toString().trim();
-                if (chromePath) return chromePath;
-            } catch (e) {
-                try {
-                    const edgePath = execSync('where msedge').toString().trim();
-                    if (edgePath) return edgePath;
-                } catch (e) {
-                    // Fall back to default installation paths
-                    const programFiles = process.env['PROGRAMFILES'] || 'C:\\Program Files';
-                    const chromePath = `${programFiles}\\Google\\Chrome\\Application\\chrome.exe`;
-                    const edgePath = `${programFiles}\\Microsoft\\Edge\\Application\\msedge.exe`;
-                    
-                    try {
-                        if (fs.existsSync(chromePath)) return chromePath;
-                        if (fs.existsSync(edgePath)) return edgePath;
-                    } catch (e) {
-                        // Ignore filesystem errors
-                    }
-                }
-            }
-        } else if (process.platform === 'linux') {
-            // On Linux, try common browser paths
-            try {
-                const chromePath = execSync('which google-chrome').toString().trim();
-                if (chromePath) return chromePath;
-            } catch (e) {
-                try {
-                    const chromiumPath = execSync('which chromium-browser').toString().trim();
-                    if (chromiumPath) return chromiumPath;
-                } catch (e) {
-                    // No default browser found
-                }
-            }
-        }
-    } catch (e) {
-        console.error('Error finding default browser:', e);
-    }
-    return null;
-}
-
-// Initialize browser instance
-async function initBrowser(headless: boolean = true, useDefaultBrowser: boolean = false): Promise<Browser> {
-    if (browser) {
-        // Check if we need to switch modes or browser type
-        const isHeadless = browser.process()?.spawnargs?.includes('--headless') ?? true;
-        const isUsingDefaultBrowser = browser.process()?.spawnargs?.includes('--remote-debugging-port') ?? false;
-        
-        if (isHeadless !== headless || isUsingDefaultBrowser !== useDefaultBrowser) {
-            await browser.close();
+function resetBrowserTimer() {
+    if (browserIdleTimer) clearTimeout(browserIdleTimer);
+    browserIdleTimer = setTimeout(async () => {
+        if (browser) {
+            try { await browser.close(); } catch {}
             browser = null;
-            persistentPage = null;
+        }
+    }, BROWSER_TIMEOUT_MS);
+    browserIdleTimer.unref();
+}
+
+async function initBrowser(headless: boolean = true): Promise<Browser> {
+    if (browser) {
+        const isHeadless = browser.process()?.spawnargs?.includes('--headless') ?? true;
+        if (isHeadless !== headless) {
+            try { await browser.close(); } catch {}
+            browser = null;
         }
     }
-    
+
     if (!browser) {
-        if (useDefaultBrowser && !headless) {
-            // Try to connect to default browser
-            const defaultBrowserPath = getDefaultBrowserPath();
-            
-            if (!defaultBrowserPath) {
-                console.error('Could not find default browser. Falling back to bundled Chromium.');
-                                    browser = await puppeteer.launch({
-                        executablePath: defaultBrowserPath ?? undefined,
-                        headless: headless,
-                        args: [
-                            '--no-sandbox',
-                            '--disable-setuid-sandbox',
-                            '--disable-dev-shm-usage',
-                            '--disable-accelerated-2d-canvas',
-                            '--no-first-run',
-                            '--no-zygote',
-                            '--disable-blink-features=AutomationControlled',
-                            '--disable-features=VizDisplayCompositor',
-                            '--disable-extensions-file-access-check',
-                            '--disable-extensions-http-throttling',
-                            '--disable-extensions-https-error-pages',
-                            '--disable-extensions',
-                            '--disable-background-timer-throttling',
-                            '--disable-renderer-backgrounding',
-                            '--disable-backgrounding-occluded-windows',
-                            '--disable-ipc-flooding-protection',
-                            '--disable-default-apps',
-                            '--disable-sync',
-                            '--disable-translate',
-                            '--hide-scrollbars',
-                            '--mute-audio',
-                            '--no-default-browser-check',
-                            '--no-pings',
-                            '--disable-web-security',
-                            '--disable-features=TranslateUI',
-                            '--disable-features=BlinkGenPropertyTrees',
-                            '--disable-client-side-phishing-detection',
-                            '--disable-component-extensions-with-background-pages',
-                            '--disable-default-apps',
-                            '--disable-hang-monitor',
-                            '--disable-prompt-on-repost',
-                            headless ? '--disable-gpu' : ''
-                        ].filter(Boolean)
-                    });
-            } else {
-                // Use random debug port in allowed range (9222-9322)
-                const debuggingPort = 9222 + Math.floor(Math.random() * 100);
-                
-                // Launch browser with debugging port
-                const userDataDir = path.join(os.tmpdir(), `puppeteer_user_data_${Date.now()}`);
-                
-                // Launch browser process using spawn instead of execSync
-                const browserProcess = spawn(
-                    defaultBrowserPath,
-                    [
-                        `--remote-debugging-port=${debuggingPort}`,
-                        `--user-data-dir=${userDataDir}`,
-                        '--no-first-run',
-                        'about:blank'
-                    ],
-                    { stdio: 'ignore', detached: true }
-                );
-                
-                // Detach the process so it continues running after our process exits
-                browserProcess.unref();
-                
-                // Wait for browser to start
-                await new Promise(resolve => setTimeout(resolve, 1000));
-                
-                // Connect to the browser
-                try {
-                    browser = await puppeteer.connect({
-                        browserURL: `http://localhost:${debuggingPort}`,
-                        defaultViewport: null
-                    });
-                    
-                    // Store user data dir for cleanup
-                    (browser as any).__userDataDir = userDataDir;
-                } catch (error) {
-                    console.error('Failed to connect to browser:', error);
-                    // Fall back to bundled browser
-                    browser = await puppeteer.launch({
-                        executablePath: defaultBrowserPath ?? undefined,
-                        headless: headless,
-                        args: [
-                            '--no-sandbox',
-                            '--disable-setuid-sandbox',
-                            '--disable-dev-shm-usage',
-                            '--disable-accelerated-2d-canvas',
-                            '--no-first-run',
-                            '--no-zygote',
-                            '--disable-blink-features=AutomationControlled',
-                            '--disable-features=VizDisplayCompositor',
-                            '--disable-extensions',
-                            '--disable-background-timer-throttling',
-                            '--disable-renderer-backgrounding',
-                            '--disable-backgrounding-occluded-windows',
-                            '--disable-ipc-flooding-protection',
-                            '--disable-default-apps',
-                            '--disable-sync',
-                            '--disable-translate',
-                            '--hide-scrollbars',
-                            '--mute-audio',
-                            '--no-default-browser-check',
-                            '--no-pings',
-                            '--disable-web-security',
-                            '--disable-features=TranslateUI',
-                            '--disable-features=BlinkGenPropertyTrees',
-                            '--disable-client-side-phishing-detection'
-                        ].filter(Boolean)
-                    });
-                }
-            }
-        } else {
-            // Use bundled browser
-            browser = await puppeteer.launch({
-                headless: headless,
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-features=VizDisplayCompositor',
-                    '--disable-extensions',
-                    '--disable-background-timer-throttling',
-                    '--disable-renderer-backgrounding',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-ipc-flooding-protection',
-                    '--disable-default-apps',
-                    '--disable-sync',
-                    '--disable-translate',
-                    '--hide-scrollbars',
-                    '--mute-audio',
-                    '--no-default-browser-check',
-                    '--no-pings',
-                    '--disable-web-security',
-                    '--disable-features=TranslateUI',
-                    '--disable-features=BlinkGenPropertyTrees',
-                    '--disable-client-side-phishing-detection',
-                    headless ? '--disable-gpu' : ''
-                ].filter(Boolean)
-            });
-        }
+        browser = await puppeteer.launch({
+            headless,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=VizDisplayCompositor',
+                '--disable-extensions',
+                '--disable-background-timer-throttling',
+                '--disable-renderer-backgrounding',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-ipc-flooding-protection',
+                '--disable-default-apps',
+                '--disable-sync',
+                '--disable-translate',
+                '--hide-scrollbars',
+                '--mute-audio',
+                '--no-default-browser-check',
+                '--no-pings',
+                '--disable-features=TranslateUI',
+                '--disable-features=BlinkGenPropertyTrees',
+                '--disable-client-side-phishing-detection',
+                headless ? '--disable-gpu' : '',
+            ].filter(Boolean),
+        });
+
+        resetBrowserTimer();
     }
+
+    resetBrowserTimer();
     return browser;
 }
 
-// Get domain from URL for cookie storage
-function getDomainFromUrl(url: string): string {
-    try {
-        const urlObj = new URL(url);
-        return urlObj.hostname.replace(/\./g, '_');
-    } catch {
-        return 'unknown';
-    }
-}
-
-// Save cookies for a domain
-async function saveCookies(url: string, cookies: Cookie[]) {
-    await ensureCookiesDir();
-    const domain = getDomainFromUrl(url);
-    const cookiesPath = path.join(cookiesDir, `${domain}.json`);
-    await fsPromises.writeFile(cookiesPath, JSON.stringify(cookies, null, 2));
-}
-
-// Load cookies for a domain
-async function loadCookies(url: string): Promise<Cookie[]> {
-    try {
-        const domain = getDomainFromUrl(url);
-        const cookiesPath = path.join(cookiesDir, `${domain}.json`);
-        const cookiesData = await fsPromises.readFile(cookiesPath, 'utf-8');
-        return JSON.parse(cookiesData);
-    } catch {
-        return [];
-    }
-}
-
-// Function to clean up resources
 async function cleanupBrowser() {
+    if (browserIdleTimer) {
+        clearTimeout(browserIdleTimer);
+        browserIdleTimer = null;
+    }
     if (browser) {
-        // Clean up user data directory if it exists (for default browser)
-        const userDataDir = (browser as any).__userDataDir;
-        
-        try {
-            await browser.close();
-        } catch (error) {
-            console.error('Error closing browser:', error);
-        }
-        
-        // Clean up user data directory if it exists
-        if (userDataDir) {
-            try {
-                await fsPromises.rm(userDataDir, { recursive: true, force: true });
-            } catch (error) {
-                console.error('Error cleaning up user data directory:', error);
-            }
-        }
-        
+        try { await browser.close(); } catch {}
         browser = null;
-        persistentPage = null;
     }
 }
 
-// Cleanup browser on exit
-process.on('exit', () => {
-    if (browser) {
-        // Can't use async here, so just do a sync cleanup of what we can
-        try {
-            browser.close().catch(() => {});
-        } catch (e) {
-            // Ignore errors on exit
-        }
-    }
-});
+process.on('exit', () => { try { browser?.close().catch(() => {}); } catch {} });
+process.on('SIGINT', async () => { await cleanupBrowser(); process.exit(0); });
+process.on('SIGTERM', async () => { await cleanupBrowser(); process.exit(0); });
 
-process.on('SIGINT', async () => {
-    await cleanupBrowser();
-    process.exit(0);
-});
+// ─── Tool: screenshot-page ───────────────────────────────────────────────────
 
-process.on('SIGTERM', async () => {
-    await cleanupBrowser();
-    process.exit(0);
-});
-
-// Register the login-and-wait tool
-server.tool(
-    "login-and-wait",
-    "Opens a webpage in a visible browser window for manual login, waits for user to complete login, then saves cookies",
-    {
-        url: z.string().url().describe("The URL of the login page"),
-        waitMinutes: z.number().optional().default(3).describe("Maximum minutes to wait for login (default: 3)"),
-        successIndicator: z.string().optional().describe("Optional CSS selector or URL pattern that indicates successful login"),
-        useDefaultBrowser: z.boolean().optional().default(true).describe("Whether to use the system's default browser instead of Puppeteer's bundled Chromium")
-    },
-    async ({ url, waitMinutes, successIndicator, useDefaultBrowser }) => {
-        let page: Page | null = null;
-        
-        try {
-            // Initialize browser in non-headless mode with default browser option
-            const browserInstance = await initBrowser(false, useDefaultBrowser);
-            
-            // Create or reuse persistent page
-            if (!persistentPage || persistentPage.isClosed()) {
-                persistentPage = await browserInstance.newPage();
-            }
-            page = persistentPage;
-            
-            // Load existing cookies if available
-            const existingCookies = await loadCookies(url);
-            if (existingCookies.length > 0) {
-                await page.setCookie(...existingCookies);
-            }
-            
-            // Set user agent and anti-detection measures for login
-            await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-            
-            // Additional anti-detection measures for Google login
-            await page.evaluateOnNewDocument(() => {
-                // Remove webdriver property
-                delete (window.navigator as any).webdriver;
-                
-                // Override the plugins property to add fake plugins
-                Object.defineProperty(window.navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
-                });
-                
-                // Override the languages property
-                Object.defineProperty(window.navigator, 'languages', {
-                    get: () => ['en-US', 'en']
-                });
-                
-                // Override permissions
-                Object.defineProperty(window.navigator, 'permissions', {
-                    get: () => ({
-                        query: () => Promise.resolve({ state: 'granted' })
-                    })
-                });
-            });
-            
-            // Navigate to the URL
-            await page.goto(url, {
-                waitUntil: 'networkidle2',
-                timeout: 30000
-            });
-            
-            const startTime = Date.now();
-            const maxWaitTime = waitMinutes * 60 * 1000;
-            
-            // Wait for login
-            console.error(`Waiting for manual login... (up to ${waitMinutes} minutes)`);
-            console.error(`Please complete the login in the ${useDefaultBrowser ? 'default' : 'Puppeteer'} browser window.`);
-            console.error(`To continue immediately after login, use the 'signal-login-complete' tool or navigate away from the login page.`);
-            
-            if (successIndicator) {
-                try {
-                    // If it's a URL pattern
-                    if (successIndicator.startsWith('http') || successIndicator.includes('/')) {
-                        await page.waitForFunction(
-                            (pattern) => window.location.href.includes(pattern),
-                            { timeout: maxWaitTime },
-                            successIndicator
-                        );
-                    } else {
-                        // Otherwise treat as CSS selector
-                        await page.waitForSelector(successIndicator, { timeout: maxWaitTime });
-                    }
-                } catch (timeoutError) {
-                    // Continue even if indicator not found
-                    console.error('Success indicator not found, but continuing...');
-                }
-            } else {
-                // Wait for user confirmation via multiple methods
-                await new Promise((resolve) => {
-                    const checkInterval = setInterval(() => {
-                        if (Date.now() - startTime > maxWaitTime) {
-                            clearInterval(checkInterval);
-                            resolve(null);
-                        }
-                    }, 1000);
-                    
-                    // Method 1: Page navigation detection
-                    page?.on('framenavigated', () => {
-                        const currentUrl = page?.url() || '';
-                        // Check if we've navigated away from login pages
-                        if (!currentUrl.includes('accounts.google.com') && 
-                            !currentUrl.includes('login') && 
-                            !currentUrl.includes('signin') &&
-                            !currentUrl.includes('auth')) {
-                            setTimeout(() => {
-                                clearInterval(checkInterval);
-                                resolve(null);
-                            }, 2000);
-                        }
-                    });
-                    
-                    // Method 2: Check for a completion marker file
-                    const completionFile = path.join(os.tmpdir(), 'mcp-login-complete.txt');
-                    const fileCheckInterval = setInterval(async () => {
-                        try {
-                            if (fs.existsSync(completionFile)) {
-                                await fsPromises.unlink(completionFile).catch(() => {});
-                                clearInterval(checkInterval);
-                                clearInterval(fileCheckInterval);
-                                resolve(null);
-                            }
-                        } catch (e) {
-                            // Ignore file check errors
-                        }
-                    }, 1000);
-                    
-                    // Clean up file checker when main interval ends
-                    setTimeout(() => {
-                        clearInterval(fileCheckInterval);
-                    }, maxWaitTime);
-                });
-            }
-            
-            // Save cookies after login
-            const cookies = await page.cookies();
-            await saveCookies(url, cookies);
-            
-            const finalUrl = page.url();
-            const browserType = useDefaultBrowser ? 'default browser' : 'Puppeteer browser';
-            
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Login session established and cookies saved!\n\nBrowser: ${browserType}\nInitial URL: ${url}\nFinal URL: ${finalUrl}\nCookies saved: ${cookies.length}\n\nLogin completed via: ${successIndicator ? 'success indicator detected' : 'automatic navigation detection or manual signal'}\n\nThe browser window will remain open for future screenshots.`
-                    }
-                ],
-            };
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            return {
-                isError: true,
-                content: [
-                    {
-                        type: "text",
-                        text: `Error during login process: ${errorMessage}`,
-                    },
-                ],
-            };
-        }
-        // Don't close the page - keep it for future use
-    }
-);
-
-// Updated screenshot-page tool with authentication support
 server.tool(
     "screenshot-page",
-    "Captures a screenshot of a given URL and returns it as base64 encoded image. Can use saved cookies from login-and-wait.",
+    "Captures a screenshot of a given URL and returns it as base64 encoded image.",
     {
         url: z.string().url().describe("The URL of the webpage to screenshot"),
         fullPage: z.boolean().optional().default(true).describe("Whether to capture the full page or just the viewport"),
         width: z.number().optional().default(1920).describe("Viewport width in pixels"),
         height: z.number().optional().default(1080).describe("Viewport height in pixels"),
         format: z.enum(['png', 'jpeg', 'webp']).optional().default('png').describe("Image format for the screenshot"),
-        quality: z.number().min(0).max(100).optional().describe("Quality of the image (0-100), only applicable for jpeg and webp"),
+        quality: z.number().min(0).max(100).optional().describe("Quality of the image (0-100), only for jpeg/webp"),
         waitFor: z.enum(['load', 'domcontentloaded', 'networkidle0', 'networkidle2']).optional().default('networkidle2').describe("When to consider the page loaded"),
-        delay: z.number().optional().default(0).describe("Additional delay in milliseconds to wait after page load"),
-        useSavedAuth: z.boolean().optional().default(true).describe("Whether to use saved cookies from previous login"),
-        reuseAuthPage: z.boolean().optional().default(false).describe("Whether to use the existing authenticated page instead of creating a new one"),
-        useDefaultBrowser: z.boolean().optional().default(false).describe("Whether to use the system's default browser instead of Puppeteer's bundled Chromium"),
-        visibleBrowser: z.boolean().optional().default(false).describe("Whether to show the browser window (non-headless mode)")
+        delay: z.number().optional().default(0).describe("Additional delay in milliseconds after page load"),
     },
-    async ({ url, fullPage, width, height, format, quality, waitFor, delay, useSavedAuth, reuseAuthPage, useDefaultBrowser, visibleBrowser }) => {
+    async ({ url, fullPage, width, height, format, quality, waitFor, delay }) => {
+        assertUrlAllowed(url);
+
         let page: Page | null = null;
-        let shouldClosePage = true;
-        
         try {
-            // Initialize browser with appropriate options
-            const isHeadless = !visibleBrowser;
-            const browserInstance = await initBrowser(isHeadless, useDefaultBrowser && visibleBrowser);
-            
-            // Check if we should reuse the authenticated page
-            if (reuseAuthPage && persistentPage && !persistentPage.isClosed()) {
-                page = persistentPage;
-                shouldClosePage = false;
-                
-                // Navigate to the new URL if different
-                const currentUrl = page.url();
-                if (currentUrl !== url) {
-                    await page.goto(url, {
-                        waitUntil: waitFor as any,
-                        timeout: 30000
-                    });
-                }
-            } else {
-                // Create a new page
-                page = await browserInstance.newPage();
-                
-                // Load saved cookies if requested
-                if (useSavedAuth) {
-                    const cookies = await loadCookies(url);
-                    if (cookies.length > 0) {
-                        await page.setCookie(...cookies);
-                    }
-                }
-                
-                // Set viewport
-                await page.setViewport({ width, height });
-                
-                // Set user agent to avoid bot detection
-                await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-                
-                // Additional anti-detection measures for Google
-                await page.evaluateOnNewDocument(() => {
-                    // Remove webdriver property
-                    delete (window.navigator as any).webdriver;
-                    
-                    // Override the plugins property to add fake plugins
-                    Object.defineProperty(window.navigator, 'plugins', {
-                        get: () => [1, 2, 3, 4, 5]
-                    });
-                    
-                    // Override the languages property
-                    Object.defineProperty(window.navigator, 'languages', {
-                        get: () => ['en-US', 'en']
-                    });
-                    
-                    // Override permissions
-                    Object.defineProperty(window.navigator, 'permissions', {
-                        get: () => ({
-                            query: () => Promise.resolve({ state: 'granted' })
-                        })
-                    });
-                });
-                
-                // Navigate to the URL
-                await page.goto(url, {
-                    waitUntil: waitFor as any,
-                    timeout: 30000
-                });
-            }
-            
-            // Optional delay
+            const browserInstance = await initBrowser(true);
+            page = await browserInstance.newPage();
+
+            await page.setViewport({ width, height });
+            await page.setUserAgent(
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            );
+
+            await page.goto(url, { waitUntil: waitFor as any, timeout: 30_000 });
+
             if (delay > 0) {
-                await new Promise(resolve => setTimeout(resolve, delay));
+                await new Promise((resolve) => setTimeout(resolve, delay));
             }
-            
-            // Prepare screenshot options
+
             const screenshotOptions: any = {
                 encoding: 'base64',
                 fullPage,
-                type: format
+                type: format,
             };
-            
-            // Add quality option for jpeg and webp
             if ((format === 'jpeg' || format === 'webp') && quality !== undefined) {
                 screenshotOptions.quality = quality;
             }
-            
-            // Take screenshot
+
             const screenshot = await page.screenshot(screenshotOptions) as string;
-            
-            // Get page title and final URL for context
             const pageTitle = await page.title();
             const finalUrl = page.url();
-            
-            // If using a new page, save any new cookies
-            if (!reuseAuthPage && useSavedAuth) {
-                const currentCookies = await page.cookies();
-                if (currentCookies.length > 0) {
-                    await saveCookies(url, currentCookies);
-                }
-            }
-            
-            // Determine browser type for response
-            const browserType = useDefaultBrowser && visibleBrowser ? 'default browser' : 'Puppeteer browser';
-            const browserMode = visibleBrowser ? 'visible' : 'headless';
-            
+
             return {
                 content: [
                     {
                         type: "text",
-                        text: `Screenshot captured successfully!\n\nBrowser: ${browserType} (${browserMode})\nPage Title: ${pageTitle}\nFinal URL: ${finalUrl}\nFormat: ${format}\nDimensions: ${width}x${height}\nFull Page: ${fullPage}\nUsed saved auth: ${useSavedAuth}\nReused auth page: ${reuseAuthPage}`
+                        text: `Screenshot captured!\n\nPage Title: ${pageTitle}\nFinal URL: ${finalUrl}\nFormat: ${format}\nDimensions: ${width}x${height}\nFull Page: ${fullPage}`,
                     },
                     {
                         type: "image",
                         data: screenshot,
-                        mimeType: `image/${format}`
-                    }
+                        mimeType: `image/${format}`,
+                    },
                 ],
             };
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
             return {
                 isError: true,
-                content: [
-                    {
-                        type: "text",
-                        text: `Error capturing screenshot: ${errorMessage}`,
-                    },
-                ],
+                content: [{ type: "text", text: `Error capturing screenshot: ${errorMessage}` }],
             };
         } finally {
-            // Only close the page if it's not the persistent one or if we should close it
-            if (page && shouldClosePage && page !== persistentPage) {
-                await page.close().catch(() => {});
-            }
+            if (page) await page.close().catch(() => {});
         }
     }
 );
 
-// Tool to signal login completion
-server.tool(
-    "signal-login-complete",
-    "Signals that manual login is complete and the login-and-wait tool should continue",
-    {},
-    async () => {
-        try {
-            const completionFile = path.join(os.tmpdir(), 'mcp-login-complete.txt');
-            await fsPromises.writeFile(completionFile, 'complete');
-            
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: "Login completion signal sent! The login-and-wait tool should continue shortly."
-                    }
-                ],
-            };
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            return {
-                isError: true,
-                content: [
-                    {
-                        type: "text",
-                        text: `Error signaling login completion: ${errorMessage}`,
-                    },
-                ],
-            };
-        }
-    }
-);
+// ─── Tool: screenshot-element ────────────────────────────────────────────────
 
-// Tool to clear saved cookies
-server.tool(
-    "clear-auth-cookies",
-    "Clears saved authentication cookies for a specific domain or all domains",
-    {
-        url: z.string().url().optional().describe("URL of the domain to clear cookies for. If not provided, clears all cookies."),
-    },
-    async ({ url }) => {
-        try {
-            await ensureCookiesDir();
-            
-            if (url) {
-                // Clear cookies for specific domain
-                const domain = getDomainFromUrl(url);
-                const cookiesPath = path.join(cookiesDir, `${domain}.json`);
-                try {
-                    await fsPromises.unlink(cookiesPath);
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: `Cookies cleared for domain: ${domain}`
-                            }
-                        ],
-                    };
-                } catch {
-                    return {
-                        content: [
-                            {
-                                type: "text",
-                                text: `No cookies found for domain: ${domain}`
-                            }
-                        ],
-                    };
-                }
-            } else {
-                // Clear all cookies
-                const files = await fsPromises.readdir(cookiesDir);
-                for (const file of files) {
-                    if (file.endsWith('.json')) {
-                        await fsPromises.unlink(path.join(cookiesDir, file));
-                    }
-                }
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `All saved cookies cleared (${files.length} domains)`
-                        }
-                    ],
-                };
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            return {
-                isError: true,
-                content: [
-                    {
-                        type: "text",
-                        text: `Error clearing cookies: ${errorMessage}`,
-                    },
-                ],
-            };
-        }
-    }
-);
-
-// Keep the screenshot-element tool as before, but add default browser support
 server.tool(
     "screenshot-element",
     "Captures a screenshot of a specific element on a webpage using a CSS selector",
@@ -761,168 +273,108 @@ server.tool(
         selector: z.string().describe("CSS selector for the element to screenshot"),
         waitForSelector: z.boolean().optional().default(true).describe("Whether to wait for the selector to appear"),
         format: z.enum(['png', 'jpeg', 'webp']).optional().default('png').describe("Image format for the screenshot"),
-        quality: z.number().min(0).max(100).optional().describe("Quality of the image (0-100), only applicable for jpeg and webp"),
+        quality: z.number().min(0).max(100).optional().describe("Quality of the image (0-100), only for jpeg/webp"),
         padding: z.number().optional().default(0).describe("Padding around the element in pixels"),
-        useSavedAuth: z.boolean().optional().default(true).describe("Whether to use saved cookies from previous login"),
-        useDefaultBrowser: z.boolean().optional().default(false).describe("Whether to use the system's default browser instead of Puppeteer's bundled Chromium"),
-        visibleBrowser: z.boolean().optional().default(false).describe("Whether to show the browser window (non-headless mode)")
     },
-    async ({ url, selector, waitForSelector, format, quality, padding, useSavedAuth, useDefaultBrowser, visibleBrowser }) => {
+    async ({ url, selector, waitForSelector, format, quality, padding }) => {
+        assertUrlAllowed(url);
+
         let page: Page | null = null;
-        
         try {
-            // Initialize browser with appropriate options
-            const isHeadless = !visibleBrowser;
-            const browserInstance = await initBrowser(isHeadless, useDefaultBrowser && visibleBrowser);
-            
-            // Create a new page
+            const browserInstance = await initBrowser(true);
             page = await browserInstance.newPage();
-            
-            // Load saved cookies if requested
-            if (useSavedAuth) {
-                const cookies = await loadCookies(url);
-                if (cookies.length > 0) {
-                    await page.setCookie(...cookies);
-                }
-            }
-            
-            // Set viewport (matching screenshot-page tool)
+
             await page.setViewport({ width: 1920, height: 1080 });
-            
-            // Set user agent to avoid bot detection
-            await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-            
-            // Additional anti-detection measures for Google
-            await page.evaluateOnNewDocument(() => {
-                // Remove webdriver property
-                delete (window.navigator as any).webdriver;
-                
-                // Override the plugins property to add fake plugins
-                Object.defineProperty(window.navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
-                });
-                
-                // Override the languages property
-                Object.defineProperty(window.navigator, 'languages', {
-                    get: () => ['en-US', 'en']
-                });
-                
-                // Override permissions
-                Object.defineProperty(window.navigator, 'permissions', {
-                    get: () => ({
-                        query: () => Promise.resolve({ state: 'granted' })
-                    })
-                });
-            });
-            
-            // Navigate to the URL
-            await page.goto(url, {
-                waitUntil: 'networkidle2',
-                timeout: 30000
-            });
-            
-            // Wait for the selector if requested
+            await page.setUserAgent(
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            );
+
+            await page.goto(url, { waitUntil: 'networkidle2', timeout: 30_000 });
+
             if (waitForSelector) {
-                await page.waitForSelector(selector, { timeout: 10000 });
+                await page.waitForSelector(selector, { timeout: 10_000 });
             }
-            
-            // Get the element
+
             const element = await page.$(selector);
-            
             if (!element) {
                 return {
                     isError: true,
-                    content: [
-                        {
-                            type: "text",
-                            text: `Element not found with selector: ${selector}`,
-                        },
-                    ],
+                    content: [{ type: "text", text: `Element not found with selector: ${selector}` }],
                 };
             }
-            
-            // Add padding if requested
+
             if (padding > 0) {
                 await page.evaluate((sel, pad) => {
                     const el = document.querySelector(sel);
-                    if (el) {
-                        (el as HTMLElement).style.padding = `${pad}px`;
-                    }
+                    if (el) (el as HTMLElement).style.padding = `${pad}px`;
                 }, selector, padding);
             }
-            
-            // Prepare screenshot options
-            const screenshotOptions: any = {
-                encoding: 'base64',
-                type: format
-            };
-            
-            // Add quality option for jpeg and webp
+
+            const screenshotOptions: any = { encoding: 'base64', type: format };
             if ((format === 'jpeg' || format === 'webp') && quality !== undefined) {
                 screenshotOptions.quality = quality;
             }
-            
-            // Take screenshot of the element
+
             const screenshot = await element.screenshot(screenshotOptions) as string;
-            
-            // Determine browser type for response
-            const browserType = useDefaultBrowser && visibleBrowser ? 'default browser' : 'Puppeteer browser';
-            const browserMode = visibleBrowser ? 'visible' : 'headless';
-            
+
             return {
                 content: [
                     {
                         type: "text",
-                        text: `Element screenshot captured successfully!\n\nBrowser: ${browserType} (${browserMode})\nURL: ${url}\nSelector: ${selector}\nFormat: ${format}`
+                        text: `Element screenshot captured!\n\nURL: ${url}\nSelector: ${selector}\nFormat: ${format}`,
                     },
                     {
                         type: "image",
                         data: screenshot,
-                        mimeType: `image/${format}`
-                    }
+                        mimeType: `image/${format}`,
+                    },
                 ],
             };
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
             return {
                 isError: true,
-                content: [
-                    {
-                        type: "text",
-                        text: `Error capturing element screenshot: ${errorMessage}`,
-                    },
-                ],
+                content: [{ type: "text", text: `Error capturing element screenshot: ${errorMessage}` }],
             };
         } finally {
-            // Close the page
-            if (page) {
-                await page.close().catch(() => {});
-            }
+            if (page) await page.close().catch(() => {});
         }
     }
 );
 
-// Run the server over Streamable HTTP
+// ─── HTTP Server + Rate Limiting ─────────────────────────────────────────────
+
 const PORT = Number(process.env.PORT || 8200);
 const PATHNAME = process.env.MCP_PATH || "/mcp";
-
-// Persist one transport per MCP session (identified by session ID).
 const transports = new Map();
+
+function getClientIp(req: http.IncomingMessage): string {
+    const xfwd = req.headers['x-forwarded-for'];
+    if (typeof xfwd === 'string') return xfwd.split(',')[0].trim();
+    return req.socket.remoteAddress || 'unknown';
+}
 
 async function main() {
     const httpServer = http.createServer(async (req, res) => {
+        const clientIp = getClientIp(req);
         const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
         if (url.pathname !== PATHNAME) {
             res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: `Not found: ${url.pathname}` }));
+            res.end(JSON.stringify({ error: "Not found" }));
             return;
         }
 
-        // CORS for browsers
-        res.setHeader("Access-Control-Allow-Origin", "*");
+        // Rate limit
+        if (!rateLimiter.allow(clientIp)) {
+            res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
+            res.end(JSON.stringify({ error: "Rate limit exceeded. Try again later." }));
+            return;
+        }
+
+        // CORS — restricted: no wildcard, accept only same-origin or configured origins
         res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Last-Event-ID");
-        res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+        res.setHeader("Access-Control-Allow-Methods", "POST, DELETE, OPTIONS");
         res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
         if (req.method === "OPTIONS") {
@@ -931,7 +383,6 @@ async function main() {
             return;
         }
 
-        // Reuse an existing transport for this session, or create a new one.
         const sessionId = req.headers["mcp-session-id"];
         let transport = typeof sessionId === "string" ? transports.get(sessionId) : undefined;
 
@@ -940,7 +391,6 @@ async function main() {
                 sessionIdGenerator: () => randomUUID(),
                 enableJsonResponse: true,
                 onsessioninitialized: (sid) => {
-                    // Map the session once the server assigns its ID.
                     transports.set(sid, transport);
                 },
             });
@@ -961,7 +411,7 @@ async function main() {
                     transport.handleRequest(req, res, parsed);
                 } catch (e) {
                     res.writeHead(400, { "Content-Type": "application/json" });
-                    res.end(JSON.stringify({ error: "Invalid JSON body", detail: String(e) }));
+                    res.end(JSON.stringify({ error: "Invalid JSON body" }));
                 }
             });
         } else {
@@ -971,7 +421,7 @@ async function main() {
     });
 
     httpServer.listen(PORT, "0.0.0.0", () => {
-        console.error(`Screenshot MCP Server running on Streamable HTTP at http://0.0.0.0:${PORT}${PATHNAME}`);
+        console.error(`Screenshot MCP Server running on http://0.0.0.0:${PORT}${PATHNAME}`);
     });
 
     const shutdown = async () => {
@@ -985,4 +435,5 @@ async function main() {
 
 main().catch((error) => {
     console.error("Fatal error in main():", error);
-    process.exit(1);});
+    process.exit(1);
+});
