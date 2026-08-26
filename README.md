@@ -1,5 +1,11 @@
 # Webpage Screenshot MCP Server
 
+Fork of [ananddtyagi/webpage-screenshot-mcp](https://github.com/ananddtyagi/webpage-screenshot-mcp) with the following changes:
+
+- **Streamable HTTP transport** instead of stdio — the server runs as a standalone HTTP service
+- **Docker support** with Chromium bundled inside the image
+- **System Chromium** — uses OS-installed Chromium instead of Puppeteer's bundled download
+
 An MCP (Model Context Protocol) server that captures screenshots of web pages using Puppeteer. This server allows AI agents to visually verify web applications and see their progress when generating web apps.
 
 ![Screen Recording May 27 2025 (2)](https://github.com/user-attachments/assets/9f186ec4-5a5c-449b-9a30-a5ec0cdba695)
@@ -15,63 +21,52 @@ An MCP (Model Context Protocol) server that captures screenshots of web pages us
 - **Authentication support**: Manual login and cookie persistence
 - **Default browser integration**: Use your system's default browser for a more natural experience
 - **Session persistence**: Keep browser sessions open for multi-step workflows
+- **Streamable HTTP transport**: Host as a remote MCP server over HTTP
 
 ## Installation
 
-### Quick Start (Claude Desktop Extension)
-
-Drag and drop the generated `screenshot-webpage-mcp.dxt` file into Claude Desktop for automatic installation!
-
-### Manual Installation
-
-To install and build the MCP from source:
+### Docker (recommended)
 
 ```bash
-# Clone the repository (if you haven't already)
-git clone https://github.com/ananddtyagi/webpage-screenshot-mcp.git
+git clone https://github.com/IgorVasilekIV/webpage-screenshot-mcp.git
 cd webpage-screenshot-mcp
-
-# Install dependencies
-npm install
-
-# Build the project
-npm run build
+docker build -t webpage-screenshot-mcp .
+docker run -d \
+  --name mcp-screenshot \
+  --restart unless-stopped \
+  -p 127.0.0.1:8200:8200 \
+  --memory=1g \
+  --cpus=1.0 \
+  --shm-size=512m \
+  webpage-screenshot-mcp
 ```
 
-The MCP server is built using TypeScript and compiled to JavaScript. The `dist` folder contains the compiled JavaScript files. 
+### Without Docker
+
+Requires system Chromium (`/usr/bin/chromium`).
+
+```bash
+git clone https://github.com/IgorVasilekIV/webpage-screenshot-mcp.git
+cd webpage-screenshot-mcp
+PUPPETEER_SKIP_DOWNLOAD=1 npm install
+npm run build
+PORT=8200 PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium node dist/index.js
+```
+
+The server listens on `http://0.0.0.0:8200/mcp` (Streamable HTTP).
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `8200` | HTTP listen port |
+| `MCP_PATH` | `/mcp` | URL path for the MCP endpoint |
+| `PUPPETEER_EXECUTABLE_PATH` | — | Path to Chromium/Chrome binary |
+| `PUPPETEER_SKIP_DOWNLOAD` | `1` | Skip Puppeteer's bundled browser download |
 
 ### Adding to Claude or Cursor
 
-To add this MCP to Claude Desktop or Cursor:
-
-1. **Claude Desktop**:
-   - Go to Settings > Developer
-   - Click "Edit Config"
-   - Add the following:
-
-   ```json
-    "webpage-screenshot": {
-      "command": "node",
-      "args": [
-        "~/path/to/webpage-screenshot-mcp/dist/index.js"
-      ]
-    }
-   ```
-   - Save and reload Claude
-
-2. **Cursor**:
-   - Open Cursor and go to Cursor Settings > MCP
-   - Click "Add new global MCP server"
-   - Add the following:
-  
-  ```json
-    "webpage-screenshot": {
-      "command": "node",
-      "args": ["~/path/to/webpage-screenshot-mcp/dist/index.js"]
-    }
-   ```
-
-   - Save and reload Cursor
+Since this server uses Streamable HTTP, add it as a remote MCP server pointing to `http://your-host:8200/mcp` instead of a local stdio command.
 
 ## Usage
 
